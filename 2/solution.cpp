@@ -182,6 +182,16 @@ execute_command_line(const struct command_line *line)
     }
     segments.push_back(std::move(cur));
 
+    if (segments.size() == 1 && segments[0].cmds.size() == 1) {
+        const command *only = segments[0].cmds[0];
+        if (only->exe == "exit") {
+            if (line->out_type == OUTPUT_TYPE_STDOUT && !line->is_background) {
+                int code = 0;
+                if (!only->args.empty()) code = atoi(only->args[0].c_str());
+                return code & 0xFF;
+            }
+        }
+    }
     int last_status = 0;
     for (size_t si = 0; si < segments.size(); ++si) {
         const segment &seg = segments[si];
@@ -261,6 +271,21 @@ main(void)
 				fprintf(stderr, "Parse error: %d\n", (int)err);
 				continue;
 			}
+
+            if (line->exprs.size() == 1) {
+                const expr &e = line->exprs.front();
+
+                if (e.type == EXPR_TYPE_COMMAND && e.cmd->exe == "exit") {
+                    int code = 0;
+                    if (!e.cmd->args.empty())
+                        code = atoi(e.cmd->args[0].c_str());
+
+                    delete line;
+                    parser_delete(p);
+                    return code & 0xFF;
+                }
+            }
+
 			last_status = execute_command_line(line) & 0xFF;
 			delete line;
 		}
