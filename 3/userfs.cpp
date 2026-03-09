@@ -30,6 +30,7 @@ struct file {
 
 	size_t size = 0;
 	block* last = nullptr;
+	int blocks_count = 0;
 	bool deleted = false;
 };
 
@@ -78,6 +79,7 @@ ufs_open(const char *filename, int flags)
             f->refs = 1;
             f->size = 0;
             f->last = nullptr;
+			f->blocks_count = 0;
             f->deleted = false;
 
             rlist_add_tail(&file_list, &f->in_file_list);
@@ -110,27 +112,42 @@ ufs_open(const char *filename, int flags)
 
 static block* allocate_block() {
     block* b = new block();
+	std::memset(b->memory, 0, BLOCK_SIZE);
     return b;
 }
 
 static block* get_block_by_index(file* f, int index, bool create)
 {
-    int i = 0;
-    rlist* it;
+    if (index < 0)
+        return nullptr;
 
-    rlist_foreach(it, &f->blocks) {
-        if (i == index) {
-            return rlist_entry(it, block, in_block_list);
+    if (index < f->blocks_count) {
+        if (index < f->blocks_count / 2) {
+            int i = 0;
+            rlist* it = f->blocks.next;
+            while (it != &f->blocks) {
+                if (i == index)
+                    return rlist_entry(it, block, in_block_list);
+                i++;
+                it = it->next;
+            }
+        } else {
+            int i = f->blocks_count - 1;
+            rlist* it = f->blocks.prev;
+            while (it != &f->blocks) {
+                if (i == index)
+                    return rlist_entry(it, block, in_block_list);
+                i--;
+                it = it->prev;
+            }
         }
-        i++;
     }
 
     if (!create)
         return nullptr;
 
-    while (i <= index) {
+    while (f->blocks_count <= index) {
         block* new_block = allocate_block();
-
         if (!new_block) {
             ufs_error_code = UFS_ERR_NO_MEM;
             return nullptr;
@@ -138,11 +155,19 @@ static block* get_block_by_index(file* f, int index, bool create)
 
         rlist_add_tail(&f->blocks, &new_block->in_block_list);
         f->last = new_block;
+        f->blocks_count++;
+    }
 
+    if (index == f->blocks_count - 1)
+        return f->last;
+
+    int i = 0;
+    rlist* it = f->blocks.next;
+    while (it != &f->blocks) {
         if (i == index)
-            return new_block;
-
+            return rlist_entry(it, block, in_block_list);
         i++;
+        it = it->next;
     }
 
     return nullptr;
@@ -271,6 +296,7 @@ static void free_file_blocks(file* f) {
     }
 
     f->last = nullptr;
+	f->blocks_count = 0;
 }
 
 int
