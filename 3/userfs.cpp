@@ -42,6 +42,10 @@ struct filedesc {
 	size_t pos = 0;
     block* cur_block = nullptr;
     int cur_block_index = 0;
+
+#if NEED_OPEN_FLAGS
+    int flags = UFS_READ_WRITE;;
+#endif
 };
 
 static std::vector<filedesc*> file_descriptors;
@@ -97,6 +101,9 @@ ufs_open(const char *filename, int flags)
     fd_ptr->pos = 0;
     fd_ptr->cur_block = nullptr;
     fd_ptr->cur_block_index = 0;
+#if NEED_OPEN_FLAGS
+    fd_ptr->flags = flags;
+#endif
 
     for (size_t i = 0; i < file_descriptors.size(); ++i) {
         if (!file_descriptors[i]) {
@@ -110,178 +117,155 @@ ufs_open(const char *filename, int flags)
     return file_descriptors.size(); 
 }
 
-static block* allocate_block() {
-    block* b = new block();
-	std::memset(b->memory, 0, BLOCK_SIZE);
-    return b;
-}
 
-static block* get_block_by_index(file* f, int index, bool create)
-{
+static block* get_block_by_index(filedesc* desc, int index, bool create) {
+    file* f = desc->atfile;
+
+    if (desc->cur_block && desc->cur_block_index == index)
+        return desc->cur_block;
+
     if (index < 0)
         return nullptr;
 
-    if (index < f->blocks_count) {
-        if (index < f->blocks_count / 2) {
-            int i = 0;
-            rlist* it = f->blocks.next;
-            while (it != &f->blocks) {
-                if (i == index)
-                    return rlist_entry(it, block, in_block_list);
-                i++;
-                it = it->next;
-            }
-        } else {
-            int i = f->blocks_count - 1;
-            rlist* it = f->blocks.prev;
-            while (it != &f->blocks) {
-                if (i == index)
-                    return rlist_entry(it, block, in_block_list);
-                i--;
-                it = it->prev;
-            }
+    int i = 0;
+    rlist* it = f->blocks.next;
+    while (it != &f->blocks) {
+        if (i == index) {
+            desc->cur_block = rlist_entry(it, block, in_block_list);
+            desc->cur_block_index = index;
+            return desc->cur_block;
         }
+        i++;
+        it = it->next;
     }
 
     if (!create)
         return nullptr;
 
     while (f->blocks_count <= index) {
-        block* new_block = allocate_block();
-        if (!new_block) {
-            ufs_error_code = UFS_ERR_NO_MEM;
-            return nullptr;
-        }
-
-        rlist_add_tail(&f->blocks, &new_block->in_block_list);
-        f->last = new_block;
+        block* b = new block();
+        std::memset(b->memory, 0, BLOCK_SIZE);
+        rlist_add_tail(&f->blocks, &b->in_block_list);
+        f->last = b;
         f->blocks_count++;
     }
 
-    if (index == f->blocks_count - 1)
-        return f->last;
-
-    int i = 0;
-    rlist* it = f->blocks.next;
-    while (it != &f->blocks) {
-        if (i == index)
-            return rlist_entry(it, block, in_block_list);
-        i++;
-        it = it->next;
-    }
-
-    return nullptr;
+    desc->cur_block = f->last;
+    desc->cur_block_index = index;
+    return f->last;
 }
 
-ssize_t
-ufs_write(int fd, const char *buf, size_t size)
-{
-    if (fd <= 0 || (size_t)(fd - 1) >= file_descriptors.size()) {
-        ufs_error_code = UFS_ERR_NO_FILE;
-        return -1;
-    }
-
-    if (size == 0) {
-        ufs_error_code = UFS_ERR_NO_ERR;
-        return 0;
-    }
+ssize_t ufs_write(int fd, const char *buf, size_t size) {
+    if (fd <= 0 || (size_t)(fd - 1) >= file_descriptors.size())
+        return (ufs_error_code = UFS_ERR_NO_FILE, -1);
 
     filedesc* desc = file_descriptors[fd - 1];
-    if (!desc) {
-        ufs_error_code = UFS_ERR_NO_FILE;
-        return -1;
-    }
+    if (!desc)
+        return (ufs_error_code = UFS_ERR_NO_FILE, -1);
+
+#if NEED_OPEN_FLAGS
+    if (!(desc->flags & (UFS_WRITE_ONLY | UFS_READ_WRITE)))
+        return (ufs_error_code = UFS_ERR_NO_PERMISSION, -1);
+#endif
 
     file* f = desc->atfile;
+    if (size == 0)
+        return (ufs_error_code = UFS_ERR_NO_ERR, 0);
 
-    if (size > MAX_FILE_SIZE || desc->pos > MAX_FILE_SIZE - size) {
-        ufs_error_code = UFS_ERR_NO_MEM;
-        return -1;
-    }
+    if (size > MAX_FILE_SIZE || desc->pos > MAX_FILE_SIZE - size)
+        return (ufs_error_code = UFS_ERR_NO_MEM, -1);
 
     size_t written = 0;
 
+    int block_index = desc->pos / BLOCK_SIZE;
+    int offset = desc->pos % BLOCK_SIZE;
+    block* b = get_block_by_index(desc, block_index, true);
+
+    desc->cur_block = b;
+    desc->cur_block_index = block_index;
+
     while (written < size) {
-        size_t pos = desc->pos;
-
-        int block_index = pos / BLOCK_SIZE;
-        int offset = pos % BLOCK_SIZE;
-
-        block* b = get_block_by_index(f, block_index, true);
-        if (!b) {
-            ufs_error_code = UFS_ERR_NO_MEM;
-            return -1;
-        }
-
         size_t space = BLOCK_SIZE - offset;
         size_t remaining = size - written;
-        size_t chunk = space < remaining ? space : remaining;
+        size_t chunk = std::min(space, remaining);
 
         memcpy(b->memory + offset, buf + written, chunk);
 
-        desc->pos += chunk;
         written += chunk;
+        desc->pos += chunk;
+
+        if (chunk == space) {
+            block_index++;
+            offset = 0;
+            b = get_block_by_index(desc, block_index, true);
+
+            desc->cur_block = b;
+            desc->cur_block_index = block_index;
+        } else {
+            offset += chunk;
+        }
     }
 
-    if (desc->pos > f->size) {
+    if (desc->pos > f->size)
         f->size = desc->pos;
-    }
 
     ufs_error_code = UFS_ERR_NO_ERR;
     return written;
 }
 
-ssize_t
-ufs_read(int fd, char *buf, size_t size)
-{
-	if (fd <= 0 || (size_t)(fd - 1) >= file_descriptors.size()) {
-        ufs_error_code = UFS_ERR_NO_FILE;
-        return -1;
-    }
+ssize_t ufs_read(int fd, char *buf, size_t size) {
+    if (fd <= 0 || (size_t)(fd - 1) >= file_descriptors.size())
+        return (ufs_error_code = UFS_ERR_NO_FILE, -1);
 
     filedesc* desc = file_descriptors[fd - 1];
+    if (!desc)
+        return (ufs_error_code = UFS_ERR_NO_FILE, -1);
 
-    if (!desc) {
-        ufs_error_code = UFS_ERR_NO_FILE;
-        return -1;
-    }
+#if NEED_OPEN_FLAGS
+    if (!(desc->flags & (UFS_READ_ONLY | UFS_READ_WRITE)))
+        return (ufs_error_code = UFS_ERR_NO_PERMISSION, -1);
+#endif
 
     file* f = desc->atfile;
-
     if (desc->pos >= f->size)
         return 0;
 
-    size_t to_read = size;
-
-    if (desc->pos + to_read > f->size)
-        to_read = f->size - desc->pos;
-
+    size_t to_read = std::min(size, f->size - desc->pos);
     size_t read_bytes = 0;
 
+    int block_index = desc->pos / BLOCK_SIZE;
+    int offset = desc->pos % BLOCK_SIZE;
+    block* b = get_block_by_index(desc, block_index, false);
+    if (!b)
+        return 0;
+
+    desc->cur_block = b;
+    desc->cur_block_index = block_index;
+
     while (read_bytes < to_read) {
-
-        size_t pos = desc->pos;
-
-        int block_index = pos / BLOCK_SIZE;
-        int offset = pos % BLOCK_SIZE;
-
-        block* b = get_block_by_index(f, block_index, false);
-
-        if (!b)
-            break;
-
         size_t space = BLOCK_SIZE - offset;
         size_t remaining = to_read - read_bytes;
-
-        size_t chunk = space < remaining ? space : remaining;
+        size_t chunk = std::min(space, remaining);
 
         memcpy(buf + read_bytes, b->memory + offset, chunk);
 
-        desc->pos += chunk;
         read_bytes += chunk;
+        desc->pos += chunk;
+
+        if (chunk == space) {
+            block_index++;
+            offset = 0;
+            b = get_block_by_index(desc, block_index, false);
+            if (!b)
+                break;
+            desc->cur_block = b;
+            desc->cur_block_index = block_index;
+        } else {
+            offset += chunk;
+        }
     }
 
-	ufs_error_code = UFS_ERR_NO_ERR;
+    ufs_error_code = UFS_ERR_NO_ERR;
     return read_bytes;
 }
 
@@ -297,6 +281,12 @@ static void free_file_blocks(file* f) {
 
     f->last = nullptr;
 	f->blocks_count = 0;
+        for (auto fd : file_descriptors) {
+        if (fd && fd->atfile == f) {
+            fd->cur_block = nullptr;
+            fd->cur_block_index = -1;
+        }
+    }
 }
 
 int
@@ -344,6 +334,13 @@ ufs_delete(const char *filename)
 
     f->deleted = true;
 
+    for (auto fd : file_descriptors) {
+        if (fd && fd->atfile == f) {
+            fd->cur_block = nullptr;
+            fd->cur_block_index = -1;
+        }
+    }
+
     if (f->refs == 0) {
         free_file_blocks(f);
         delete f;
@@ -358,11 +355,48 @@ ufs_delete(const char *filename)
 int
 ufs_resize(int fd, size_t new_size)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)fd;
-	(void)new_size;
-	ufs_error_code = UFS_ERR_NOT_IMPLEMENTED;
-	return -1;
+	if (fd <= 0 || (size_t)(fd - 1) >= file_descriptors.size()) {
+        ufs_error_code = UFS_ERR_NO_FILE;
+        return -1;
+    }
+
+    filedesc* desc = file_descriptors[fd - 1];
+    if (!desc) {
+        ufs_error_code = UFS_ERR_NO_FILE;
+        return -1;
+    }
+
+    file* f = desc->atfile;
+
+    if (new_size > MAX_FILE_SIZE) {
+        ufs_error_code = UFS_ERR_NO_MEM;
+        return -1;
+    }
+
+    int required_blocks = (new_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    while (f->blocks_count < required_blocks) {
+        block* b = new block();
+        std::memset(b->memory, 0, BLOCK_SIZE);
+        rlist_add_tail(&f->blocks, &b->in_block_list);
+        f->last = b;
+        f->blocks_count++;
+    }
+
+    while (f->blocks_count > required_blocks) {
+        block* last_block = rlist_entry(f->blocks.prev, block, in_block_list);
+        rlist_del(&last_block->in_block_list);
+        delete last_block;
+        f->blocks_count--;
+        f->last = f->blocks_count > 0 ? rlist_entry(f->blocks.prev, block, in_block_list) : nullptr;
+    }
+
+    f->size = new_size;
+    if (desc->pos > new_size)
+        desc->pos = new_size;
+
+    ufs_error_code = UFS_ERR_NO_ERR;
+    return 0;
 }
 
 #endif
