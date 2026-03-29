@@ -82,6 +82,57 @@ static bool flush_peer_output(struct chat_server *server, chat_peer *peer)
     return true;
 }
 
+static int accept_pending_clients(struct chat_server *server)
+{
+    if (!server || server->socket < 0 || server->epoll_fd < 0)
+        return CHAT_ERR_NOT_STARTED;
+
+    while (true) {
+        struct sockaddr_in cli_addr{};
+        socklen_t cli_len = sizeof(cli_addr);
+
+        int cli_sock = accept(server->socket,
+                              (struct sockaddr *)&cli_addr,
+                              &cli_len);
+
+        if (cli_sock < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+            return CHAT_ERR_SYS;
+        }
+
+        int flags = fcntl(cli_sock, F_GETFL, 0);
+        if (flags < 0)
+            flags = 0;
+        if (fcntl(cli_sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+            close(cli_sock);
+            return CHAT_ERR_SYS;
+        }
+
+        auto *peer = new chat_peer();
+        peer->socket = cli_sock;
+#if NEED_AUTHOR
+        peer->name_received = false;
+#endif
+
+        struct epoll_event ev{};
+        ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+        ev.data.ptr = peer;
+
+        if (epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, cli_sock, &ev) < 0) {
+            close(cli_sock);
+            delete peer;
+            return CHAT_ERR_SYS;
+        }
+
+        server->peers.push_back(peer);
+    }
+
+    return 0;
+}
+
 static std::string 
 trim(const std::string& s)
 {
@@ -254,40 +305,10 @@ int chat_server_update(struct chat_server *server, double timeout)
         auto *ptr = events[i].data.ptr;
 
         if (ptr == server) {
-            while (true) {
-                struct sockaddr_in cli_addr{};
-                socklen_t cli_len = sizeof(cli_addr);
-                int cli_sock = accept(server->socket, (struct sockaddr*)&cli_addr, &cli_len);
-
-                if (cli_sock < 0) {
-                    if (errno == EWOULDBLOCK || errno == EAGAIN)
-                        break;
-                    return CHAT_ERR_SYS;
-                }
-
-                int flags = fcntl(cli_sock, F_GETFL, 0);
-                if (flags < 0) flags = 0;
-                fcntl(cli_sock, F_SETFL, flags | O_NONBLOCK);
-
-                auto *peer = new chat_peer();
-                peer->socket = cli_sock;
-#if NEED_AUTHOR
-                peer->name_received = false;
-#endif
-
-                struct epoll_event ev{};
-                ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-                ev.data.ptr = peer;
-
-                if (epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, cli_sock, &ev) < 0) {
-                    close(cli_sock);
-                    delete peer;
-                    return CHAT_ERR_SYS;
-                }
-
-                server->peers.push_back(peer);
-                progress = true;
-            }
+            int rc = accept_pending_clients(server);
+            if (rc != 0)
+                return rc;
+            progress = true;
             continue;
         }
 
@@ -423,6 +444,10 @@ chat_server_feed(struct chat_server *server, const char *msg, uint32_t msg_size)
     if (!msg || msg_size == 0)
         return 0;
 
+    int rc = accept_pending_clients(server);
+    if (rc != 0)
+        return rc;
+
     server->input_buffer.append(msg, msg_size);
 
     std::string line;
@@ -447,7 +472,7 @@ chat_server_feed(struct chat_server *server, const char *msg, uint32_t msg_size)
 #else
             peer->output_buffer += line + "\n";
 #endif
-                flush_peer_output(server, peer);
+            flush_peer_output(server, peer);
         }
     }
 
